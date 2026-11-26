@@ -6,6 +6,7 @@ modules sit above this one.
 """
 
 from pyv8c import pyv8
+from ..._native import dom
 from ...idl import interface
 from ...foundation.arguments import (
     MISSING,
@@ -18,7 +19,7 @@ from ...foundation.arguments import (
 )
 from ..page_errors import HierarchyRequestError, NotFoundError, PageTypeError
 from .collections import NodeList
-from .events import EventTarget
+from .events import EVENT_TARGET_SETATTR, EventTarget
 from .mixins import _ParentNodeMixin
 from .utils import XHTML_NAMESPACE, is_element
 
@@ -188,6 +189,14 @@ def _adopt_subtree(node, services):
 
 @interface('Node', 'EventTarget')
 class Node(EventTarget):
+    # Observation is optional. An unwatched tree must not raise AttributeError
+    # through EventTarget.__getattr__ for every attribute write.
+    _mutation_observers = None
+    _on_tree_inserted = None
+    _on_removed_from_document = None
+    _shadow_root = None
+    _parser_created = False
+
     #: ``nodeType`` reads as a constant: it is not enumerated on an instance.
     __idl_overrides__ = {"members": {"nodeType": {"property_flags": "dont_enum"}}}
 
@@ -204,10 +213,8 @@ class Node(EventTarget):
 
     def __init__(self, services=None, node_type=0, node_name="", value=None, **kw):
         super().__init__(services=services, **kw)
-        self.nodeType, self.nodeName, self.nodeValue = node_type, node_name, value
-        self.parentNode = None
-        self._children = _ChildList(self)
-        self._child_nodes_view = NodeList(owner=self, getter=lambda: self._children)
+        dom.initialize_node(self, node_type, node_name, value,
+                                    _ChildList, NodeList, EVENT_TARGET_SETATTR)
 
     @property
     def parentElement(self):
@@ -384,6 +391,9 @@ class Node(EventTarget):
             for child in self._children
         )
     def set_textContent(self, value):
+        if getattr(self, 'localName', '') == 'script':
+            from ..bom.trusted_types import trusted_string
+            value = trusted_string(self._services, value, 'Script', 'HTMLScriptElement textContent')
         from .character_data import Text
 
         if not is_nullish(value):
@@ -728,6 +738,8 @@ class ShadowRoot(DocumentFragment):
         return view
     def get_innerHTML(self): return "".join(child.outer_html() for child in self._children)
     def set_innerHTML(self, value):
+        from ..bom.trusted_types import trusted_string
+        value = trusted_string(self._services, value, 'HTML', 'ShadowRoot innerHTML')
         self._replace_children(())
         if self._services:
             self._services.document_services.document._parse_fragment(

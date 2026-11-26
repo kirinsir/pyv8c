@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import pickle
 import time
@@ -29,8 +30,34 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 #: offline extractor.  The sidecar ``idl.json`` and the ``.pyv8ccache`` beside it are caches this
 #: reader writes on first use, and ``.gitignore`` keeps both out of a release.
 DEFAULT_IDL_PATH = PACKAGE_ROOT / "idl" / "idl.zip"
+_HOST_IDLS = {
+    "win32": DEFAULT_IDL_PATH,
+    "darwin": DEFAULT_IDL_PATH.with_name("idl-158.0.8127.36.zip"),
+}
 #: The profile a collection run writes; the surface is a section of it.
 PROFILE_PATH = PACKAGE_ROOT / "data" / "chrome-environment.json"
+
+
+def idl_path(platform=None):
+    """The packaged IDL for *platform*, or this host when omitted.
+
+    ``Idl.load`` with no path still reads the baseline zip. A ``Browser`` pairs the
+    packaged Mac profile with the darwin archive when ``idl_path`` is omitted;
+    every other ``Browser`` reads the baseline zip. An unknown platform, or a
+    host file that is not packaged, is that same baseline.
+    """
+    name = sys.platform if platform is None else platform
+    chosen = _HOST_IDLS.get(name, DEFAULT_IDL_PATH)
+    if chosen.is_file():
+        return chosen
+    return DEFAULT_IDL_PATH
+
+
+def _document_label(target):
+    """A path inside this package stays ``pyv8c:``; anything else is absolute."""
+    if target.is_relative_to(PACKAGE_ROOT):
+        return f"pyv8c:{target.relative_to(PACKAGE_ROOT).as_posix()}"
+    return str(target)
 
 
 #: What an interface borrows from ``Array.prototype``, as the bits ``IdlSpec.array`` installs.
@@ -540,9 +567,10 @@ class Idl:
         self._descendants: dict[str, tuple] = {}
         self._ancestors: dict[str, tuple] = {}
         self._members: dict[tuple, IdlMember | None] = {}
-        #: ``interface -> (kind, name) -> IdlMember``: what :meth:`_own_member` answers without
+        #: ``interface -> (kind, name) -> IdlMember``: what :meth:`_own_member_index` answers without
         #: rebuilding the member list and re-sorting it on every walk up the parent chain.
         self._member_index: dict[str, dict] = {}
+        self._descendant_members: dict[str, dict] = {}
         self._declared: dict[tuple, bool] = {}
         self._exposed: dict[tuple, tuple] = {}
         self._aliases: dict[str, str] | None = None
@@ -552,10 +580,9 @@ class Idl:
         """The document at *path*, narrowed by *profile*: the shipped one unless told otherwise."""
         if path is None:
             target = DEFAULT_IDL_PATH
-            label = f"pyv8c:{target.relative_to(PACKAGE_ROOT).as_posix()}" if target.is_relative_to(PACKAGE_ROOT) else str(target)
         else:
             target = Path(path).expanduser().resolve()
-            label = str(target)
+        label = _document_label(target)
         if not target.is_file():
             raise FileNotFoundError(f"the IDL document does not exist: {target}")
         (label, digest, metadata, interfaces), load_timings = _read_file(target, label)
@@ -714,16 +741,20 @@ class Idl:
             return self._members[key]
         found = None
         for current in self.ancestors(name):
-            match = self._own_member(current, public_name, kind)
+            match = self._own_member_index(current).get((kind, public_name))
             if match is not None:
                 found = match
                 break
         if found is None and not self._omits_anywhere(name, public_name):
             # A descendant can carry a WorkerGlobalScope member, not one this browser omits.
-            for candidate in self.descendants(name):
-                found = self._own_member(candidate, public_name, kind)
-                if found is not None:
-                    break
+            index = self._descendant_members.get(name)
+            if index is None:
+                index = {}
+                for candidate in self.descendants(name):
+                    for member_key, member in self._own_member_index(candidate).items():
+                        index.setdefault(member_key, member)
+                self._descendant_members[name] = index
+            found = index.get((kind, public_name))
         self._members[key] = found
         return found
 
@@ -733,7 +764,7 @@ class Idl:
             return False
         return any(self.profile.omits(name, location, public_name) for location in LOCATIONS)
 
-    def _own_member(self, name, public_name, kind) -> IdlMember | None:
+    def _own_member_index(self, name) -> dict:
         index = self._member_index.get(name)
         if index is None:
             index = {}
@@ -744,7 +775,7 @@ class Idl:
                 if held is None or (member.main_world and not held.main_world):
                     index[(member.kind, member.name)] = member
             self._member_index[name] = index
-        return index.get((kind, public_name))
+        return index
 
     def declares(self, name, public_name, kind) -> bool:
         """Whether the document declares this member anywhere near the interface."""

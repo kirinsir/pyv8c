@@ -116,11 +116,11 @@ def _publish_window_name(context, page):
 _NON_ISOLATED_HIDDEN = ("SharedArrayBuffer",)
 
 
-def _declare_realm_interfaces(context, *, context_type, bindings):
+def _declare_realm_interfaces(context, *, context_type, bindings, isolated=False):
     """Declare the realm's plan; the realm answers each name itself."""
     plan = bindings.plan(context_type)
     context.install(plan.installs)
-    for name in _NON_ISOLATED_HIDDEN:
+    for name in (() if isolated else _NON_ISOLATED_HIDDEN):
         context.hide_global(name)
     #: Every interface is still a lazy constructor after startup, including the
     #: ones the context installed while its template was built.
@@ -149,6 +149,8 @@ class WorkerRealm:
         self._resource_scope = ResourceScope()
         self.resource_ownership = ResourceOwnership(self._resource_scope)
         self.services = WorkerRealmServices(self.tasks, self)
+        self.services.realm_services.performance.clock.resolution_ms = (
+            0.005 if config.cross_origin_isolated else 0.1)
         self.callback_boundary = None
 
     def is_closed(self):
@@ -175,7 +177,8 @@ class WorkerRealm:
         # services, including its microtask queue, not the creator page's.
         session.realm = self.services
         session.prepare("Worker")
-        self.isolate = pyv8.Isolate()
+        self.isolate = pyv8.Isolate(thread_bound=True)
+        self.isolate.set_host_datetime(config.environment.timezone, config.environment.language)
         from ..web.fetch.response import wasm_response_payload
         self.isolate._set_wasm_response_handler(wasm_response_payload)
         self.microtasks = pyv8.MicrotaskQueue(self.isolate)
@@ -189,7 +192,9 @@ class WorkerRealm:
             self.v8_context,
             context_type="Worker",
             bindings=config.bindings,
+            isolated=config.cross_origin_isolated,
         )
+        self.v8_context.enable_console()
         return self.v8_context
 
     # The worker's global scope reaches these through WorkerRealmServices, as a
@@ -257,6 +262,7 @@ class PageRealm:
         self.page = page
         self.v8_context = None
         self.rejections = None
+        self.http_driver = None
         self.executor = executor
         browser = page.profile.browser
         # Web objects built through this session receive PageServices, not the
@@ -274,6 +280,11 @@ class PageRealm:
     def _initialize(self):
         page = self.page
         browser = page.profile.browser
+        # An iframe shares its parent's isolate, so its own environment must not
+        # replace the time zone and language already installed for that isolate.
+        if page.parent_page is None:
+            page.execution_group.isolate.set_host_datetime(
+                page.environment.timezone, page.environment.language)
         binding_started = time.perf_counter_ns()
         self.binding_session.prepare("Window")
         plan = self.binding_session.bindings.plan("Window")
@@ -320,7 +331,11 @@ class PageRealm:
             if pending:
                 self.v8_context.install_ordered(pending)
             install_window_chrome(self.v8_context, page.services)
-            for name in _NON_ISOLATED_HIDDEN:
+            self.v8_context.enable_console()
+            if page.navigation.content_policy.policies:
+                factory = page.window._window_values.value('trustedTypes')
+                self.v8_context.set_code_generation_handler(factory.code_generation)
+            for name in (() if page.navigation.cross_origin_isolated else _NON_ISOLATED_HIDDEN):
                 self.v8_context.hide_global(name)
         deferred_globals = len(plan.installs)
         deferred_declared_at = time.perf_counter_ns()
@@ -386,6 +401,7 @@ class PageRealm:
         self.executor.call(self._close_context)
 
     def _close_context(self):
+        self.http_driver = None
         if self.rejections is not None:
             self.rejections.close()
         _release_objects(self)

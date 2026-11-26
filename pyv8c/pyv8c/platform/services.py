@@ -10,12 +10,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..foundation.clock import Clock
+from ..foundation.host_errors import HostStateError
 from ..foundation.tasks import TaskSource
-from ..foundation.urls import origin_string, serialize_origin
+from ..foundation.urls import serialize_origin
 from .resources.request_headers import same_site
-from .resources.request_headers import ACCEPT_ENCODING, accept_language
 from .sessions import BindingSession
 from .state import Ownership
+from .websocket import WebSocketServices
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,10 @@ class WorkerContext:
     debug_parent: Any | None
     creator_origin: tuple
     resource_session: Any
+    background: Any
+    file_system_key: tuple | None
+    cross_origin_isolated: bool = False
+    denied_permissions: frozenset = frozenset()
 
 
 class _TaskSource:
@@ -50,7 +55,7 @@ class _TaskSource:
         return self._tasks.closed
 
     def post_task(self, callback, source=TaskSource.DOM, *, label=None, document_bound=False):
-        self._tasks.post_task(callback, source, label=label, document_bound=document_bound)
+        return self._tasks.post_task(callback, source, label=label, document_bound=document_bound)
 
 
 class _PerformanceCapability:
@@ -216,6 +221,20 @@ class _RealmCapabilityBase(_TaskSource):
         v8_context = self.v8_context
         return v8_context.heap_statistics() if v8_context is not None else {}
 
+    def memory_snapshot(self):
+        from ..foundation.heap_memory import HeapMemoryCache
+        cache = getattr(self, '_memory_cache', None)
+        if cache is None:
+            cache = self._memory_cache = HeapMemoryCache()
+        return cache.snapshot(self.heap_statistics, precise=self.cross_origin_isolated)
+
+    @property
+    def cross_origin_isolated(self):
+        return False
+
+    def permission_allowed(self, feature):
+        return True
+
 
 class _RealmCapability(_RealmCapabilityBase):
     """Realm identity, scripting and task posting (implements RealmServices)."""
@@ -258,6 +277,17 @@ class _RealmCapability(_RealmCapabilityBase):
     @property
     def v8_context(self):
         return getattr(self._owner._page_realm, "v8_context", None)
+
+    @property
+    def cross_origin_isolated(self):
+        return self._owner._navigation.cross_origin_isolated
+
+    def memory_snapshot(self):
+        cache = self._owner._page_realm.page.execution_group.heap_memory
+        return cache.snapshot(self.heap_statistics, precise=self.cross_origin_isolated)
+
+    def permission_allowed(self, feature):
+        return feature not in self._owner._navigation.denied_permissions
 
     def ancestor_origins(self):
         """The origins of this realm's ancestors, nearest first.
@@ -308,9 +338,11 @@ class _RealmCapability(_RealmCapabilityBase):
 class _TaskCapability(_TaskSource):
     """Event-loop task sources (implements TaskServices)."""
 
-    def __init__(self, tasks, frame_factory):
+    def __init__(self, tasks, frame_factory, background):
         super().__init__(tasks)
         self._frame_factory = frame_factory
+        self._background = background
+        self._websocket_lifetime = None
         self._frames = None
 
     def request_animation_frame(self, callback):
@@ -339,11 +371,26 @@ class _TaskCapability(_TaskSource):
     def cancel(self, ident):
         self._tasks.cancel(ident)
 
-    def begin_network(self):
+    def begin_network(self, stop=None):
+        self._background.begin_network(stop)
         self._tasks.begin_network()
 
-    def complete_network(self):
-        self._tasks.complete_network()
+    def complete_network(self, stop=None):
+        try:
+            self._tasks.complete_network()
+        finally:
+            self._background.complete_network(stop)
+
+    def bind_websocket_lifetime(self, scope):
+        self._websocket_lifetime = scope
+
+    def track_websocket(self, future, cancel):
+        """Track teardown and bind Worker cancellation before dialing."""
+        self._background.track(future, kind="websocket")
+        scope = self._websocket_lifetime
+        if scope is not None and scope.add(cancel):
+            future.add_done_callback(lambda _: scope.remove(cancel))
+        return scope
 
     def begin_worker(self):
         self._tasks.begin_worker()
@@ -368,10 +415,16 @@ class WorkerRealmServices:
     def __init__(self, tasks, runtime):
         from .resources.worker import WorkerResourceCapability
         self.graphics_backend = getattr(getattr(runtime.config, 'browser', None), '_graphics_backend', None)
-        self.task_services = _TaskCapability(tasks, runtime.animation_frame_lane)
+        self.gpu_enabled = runtime.config.browser.gpu_enabled
+        self.task_services = _TaskCapability(tasks, runtime.animation_frame_lane, runtime.config.background)
         runtime._resource_scope.add(self.task_services.cancel_animation_frames)
         self.realm_services = _WorkerRealmCapability(tasks, runtime)
         self.resource_services = WorkerResourceCapability(runtime)
+        session = runtime.config.resource_session
+        self.websocket_services = WebSocketServices(
+            session.profile, runtime.config.environment, self.task_services, runtime._resource_scope,
+            lambda: self.resource_services.origin, lambda: session.site_for_cookies,
+        )
 
 
 class _WorkerRealmCapability(_RealmCapabilityBase):
@@ -404,6 +457,13 @@ class _WorkerRealmCapability(_RealmCapabilityBase):
         return self._runtime.script_url
 
     @property
+    def cross_origin_isolated(self):
+        return self._runtime.config.cross_origin_isolated
+
+    def permission_allowed(self, feature):
+        return feature not in self._runtime.config.denied_permissions
+
+    @property
     def origin(self):
         return self._runtime.services.resource_services.origin
 
@@ -413,6 +473,13 @@ class _ResourceCapability:
 
     def __init__(self, owner):
         self._owner = owner
+
+    def file_system_key(self):
+        page = self._owner._page_realm.page
+        return (tuple(page.top_page.origin), tuple(self._owner._origin))
+
+    def file_system_state(self, factory):
+        return self._owner._profile.file_system_state(self.file_system_key(), factory)
 
     def load_resource(self, url, request=None):
         return self._owner._resource_fetcher.load_resource(url, request)
@@ -466,11 +533,19 @@ class _DocumentCapability:
     def parser_script_start(self, node):
         return self._owner._navigation.parser_script_start(node)
 
+    def add_content_security_policy(self, text):
+        self._owner._navigation.content_policy.add(text)
+        factory = self._owner.window._window_value('trustedTypes')
+        self._owner._page_realm.v8_context.set_code_generation_handler(factory.code_generation)
+
     def parser_script_complete(self, node, source):
         return self._owner._navigation.parser_script_complete(node, source)
 
     def parser_is_blocked(self):
         return self._owner._navigation.parser_is_blocked()
+
+    def check_parser_operation(self):
+        self._owner._page_realm.executor.check_operation()
 
     def write_markup(self, markup):
         return self._owner._navigation.write_markup(markup)
@@ -550,12 +625,24 @@ class _WorkerCapability:
     def __init__(self, owner):
         self._owner = owner
 
+    def create_executor(self, name):
+        page = self._owner._page_realm.page
+        if page.closed or page._closing:
+            raise HostStateError("Page is closing")
+        return page._background.create_worker(
+            lambda: self._owner._profile.browser._runtime.create_worker_executor(name))
+
+    def register_runtime(self, runtime):
+        self._owner._page_realm.page._background.track_worker(runtime)
+        self._owner._profile.browser._runtime.register_worker(runtime)
+
+    def discard_runtime(self, runtime):
+        self._owner._page_realm.page._background.discard_worker(runtime)
+        self._owner._profile.browser._runtime.discard_worker(runtime)
+
     def worker_configuration(self):
         from .resources.session import ResourceRequestSession
         browser = self._owner._profile.browser
-        site = serialize_origin(self._owner._origin)
-        if any(not same_site(site, ancestor) for ancestor in self._owner.realm_services.ancestor_origins()):
-            site = 'null'
         session = BindingSession(browser.bindings, self._owner)
         return WorkerContext(
             browser=browser,
@@ -569,12 +656,19 @@ class _WorkerCapability:
             devtools=self._owner._profile._devtools,
             debug_parent=self._owner._page_realm.page._devtools_target,
             creator_origin=tuple(self._owner._origin),
+            background=self._owner._page_realm.page._background,
+            file_system_key=self._owner.resource_services.file_system_key(),
+            cross_origin_isolated=self._owner.realm_services.cross_origin_isolated,
+            denied_permissions=self._owner._navigation.denied_permissions,
             resource_session=ResourceRequestSession(
                 profile=self._owner._profile, environment=self._owner.environment,
                 origin=tuple(self._owner._origin), base_url=self._owner.realm_services.url,
                 loader=browser.resource_loader, interceptor=browser.resource_interceptor,
                 backend=self._owner._profile.network_backend, cache_enabled=browser.cache_enabled,
-                site_for_cookies=site),
+                group=id(self._owner._page_realm.page.top_page),
+                site_for_cookies=self._owner._site_for_cookies(),
+                partition=serialize_origin(self._owner._page_realm.page.top_page.origin),
+                referrer_policy=self._owner._navigation.referrer_policy),
         )
 
     def create_worker_realm(self, config):
@@ -591,7 +685,7 @@ class _WorkerCapability:
 
 
 class _ContextCapability:
-    """Profile-level services: blobs, cookies, sockets (implements ContextServices)."""
+    """Profile-level services for blob URLs and cookies."""
 
     def __init__(self, owner):
         self._owner = owner
@@ -609,6 +703,9 @@ class _ContextCapability:
     def cookie_jar(self):
         return self._owner._profile.cookies
 
+    def local_storage_area(self, origin):
+        return self._owner._profile._storage.local_storage_area(origin)
+
     @property
     def _databases(self):
         return self._owner._profile._databases
@@ -622,64 +719,13 @@ class _ContextCapability:
         backend = self._owner._profile.network_backend
         return backend is not None and backend.http_available
 
-    @property
-    def ws_available(self):
-        backend = self._owner._profile.network_backend
-        return backend is not None and backend.ws_available
-
-    def websocket(self, url, protocols, callbacks):
-        backend = self._owner._profile.network_backend
-        if backend is None:
-            return None
-        return backend.websocket(
-            self._owner.task_services, url, protocols, callbacks, self._handshake(),
-        )
-
-    def _handshake(self):
-        """What the page contributes to a WebSocket handshake; Chrome sends no client
-        hint or ``Sec-Fetch-*`` on one, and the engine owns the ``Sec-WebSocket-*``."""
-        environment = self._owner.environment
-        options = {
-            "headers": {
-                "Pragma": "no-cache",
-                "Cache-Control": "no-cache",
-                "User-Agent": environment.user_agent,
-                "Accept-Encoding": ACCEPT_ENCODING,
-                "Accept-Language": accept_language(environment.languages),
-            },
-        }
-        origin = origin_string(self._owner.realm_services.url)
-        if origin != "null":
-            options["origin"] = origin
-        site = serialize_origin(self._owner._origin)
-        if any(not same_site(site, ancestor) for ancestor in self._owner.realm_services.ancestor_origins()):
-            site = 'null'
-        options['site_for_cookies'] = site
-        return options
-
-    def close_websocket(self, websocket):
-        backend = self._owner._profile.network_backend
-        if backend is not None:
-            backend.close_websocket(websocket)
-
-    def track_websocket(self, websocket):
-        self._owner._ownership.track("websockets", websocket)
-        self._owner._register_owned(
-            "websockets", websocket,
-            lambda ws=websocket: self.close_websocket(ws),
-        )
-
-    def discard_websocket(self, websocket):
-        self._owner._ownership.discard("websockets", websocket)
-        self._owner._unregister_owned("websockets", websocket)
-
     def discard_frame(self, frame):
         self._owner._ownership.discard("frames", frame)
         self._owner._unregister_owned("frames", frame)
 
     def track_frame(self, frame):
         self._owner._ownership.track("frames", frame)
-        self._owner._register_owned("frames", frame, frame.close)
+        self._owner._register_owned("frames", frame, frame._retire)
         try:
             frame._parent_scope_cleanup = lambda child=frame: self.discard_frame(child)
         except AttributeError:
@@ -694,9 +740,11 @@ class PageServices:
     """
 
     def __init__(self, profile, environment, trace, ownership: Ownership,
-                 navigation, scripts, resource_fetcher, frame_resources, document_resources, tasks, scope):
+                 navigation, scripts, resource_fetcher, frame_resources, document_resources, tasks, scope,
+                 background):
         self._profile = profile
         self.graphics_backend = profile.browser._graphics_backend
+        self.gpu_enabled = profile.browser.gpu_enabled
         self.environment = environment
         self.trace = trace
         self._ownership = ownership
@@ -722,12 +770,21 @@ class PageServices:
 
         # Narrow capabilities handed to web packages.
         self.realm_services = _RealmCapability(self)
-        self.task_services = _TaskCapability(tasks, self._animation_frame_lane)
+        self.task_services = _TaskCapability(tasks, self._animation_frame_lane, background)
         scope.add(self.task_services.cancel_animation_frames)
         self.resource_services = _ResourceCapability(self)
         self.document_services = _DocumentCapability(self)
         self.worker_services = _WorkerCapability(self)
         self.context_services = _ContextCapability(self)
+        self.websocket_services = WebSocketServices(
+            profile, environment, self.task_services, scope, lambda: self._origin, self._site_for_cookies,
+        )
+
+    def _site_for_cookies(self):
+        site = serialize_origin(self._origin)
+        if any(not same_site(site, ancestor) for ancestor in self.realm_services.ancestor_origins()):
+            return 'null'
+        return site
 
     def _register_owned(self, kind, resource, callback):
         key = (kind, id(resource))

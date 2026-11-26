@@ -7,6 +7,7 @@
 #include "watchdog.h"
 #include <v8-inspector.h>
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <string>
@@ -59,6 +60,49 @@ struct DebuggerState {
     bool pending_pause = false;
     std::string pause_reason;
 };
+// Mirror Blink's MemoryInfo IDL object: three native heap getters live on the
+// prototype, which also carries Symbol.toStringTag == "MemoryInfo" (and no own
+// constructor), so String(console.memory) yields "[object MemoryInfo]".
+static void memory_info_getter(const FunctionCallbackInfo<Value>& info) {
+    Isolate* isolate = info.GetIsolate();
+    HeapStatistics stats;
+    isolate->GetHeapStatistics(&stats);
+    int field = info.Data().As<Int32>()->Value();
+    double raw = field == 0 ? stats.heap_size_limit()
+                : field == 1 ? stats.total_heap_size()
+                             : stats.used_heap_size();
+    constexpr double bucket = 1024.0 * 1024 * 10;
+    info.GetReturnValue().Set(Number::New(isolate, std::ceil(raw / bucket) * bucket));
+}
+
+// Build one console.memory object: a plain instance inheriting from a prototype
+// that owns the three heap accessors and the MemoryInfo tag, as Blink does.
+static MaybeLocal<Object> build_memory_info(Isolate* isolate, Local<Context> context) {
+    Local<Object> proto = Object::New(isolate);
+    auto add_heap_getter = [&](const char* name, int field) {
+        Local<FunctionTemplate> tpl = FunctionTemplate::New(
+            isolate, memory_info_getter, Int32::New(isolate, field));
+        Local<Function> fn = tpl->GetFunction(context).ToLocalChecked();
+        fn->SetName(String::NewFromUtf8(
+            isolate, (std::string("get ") + name).c_str()).ToLocalChecked());
+        PropertyDescriptor descriptor(fn, Undefined(isolate));
+        descriptor.set_enumerable(true);
+        descriptor.set_configurable(true);
+        proto->DefineProperty(context,
+            String::NewFromUtf8(isolate, name).ToLocalChecked(), descriptor);
+    };
+    add_heap_getter("jsHeapSizeLimit", 0);
+    add_heap_getter("totalJSHeapSize", 1);
+    add_heap_getter("usedJSHeapSize", 2);
+    proto->DefineOwnProperty(context, Symbol::GetToStringTag(isolate),
+        String::NewFromUtf8Literal(isolate, "MemoryInfo"),
+        static_cast<PropertyAttribute>(ReadOnly | DontEnum));
+    Local<Object> info = Object::New(isolate);
+    if (info->SetPrototype(context, proto).IsNothing())
+        return MaybeLocal<Object>();
+    return info;
+}
+
 struct InspectorHub : V8InspectorClient {
     Isolate* isolate;
     std::unique_ptr<V8Inspector> inspector;
@@ -69,6 +113,20 @@ struct InspectorHub : V8InspectorClient {
     int next_group = 1;
     explicit InspectorHub(Isolate* value) : isolate(value) {
         inspector = V8Inspector::create(isolate, this);
+    }
+    MaybeLocal<Value> memoryInfo(Isolate*, Local<Context> context) override {
+        EscapableHandleScope scope(isolate);
+        MaybeLocal<Object> info = build_memory_info(isolate, context);
+        if (info.IsEmpty()) return MaybeLocal<Value>();
+        return scope.Escape(info.ToLocalChecked());
+    }
+    // Register a realm with the inspector.  The console asks V8 to expose
+    // MemoryInfo on every context, so the flag belongs here rather than being
+    // repeated at each of the call sites.
+    void context_created(context_c* context, int group) {
+        V8ContextInfo info(context->js_context.Get(isolate), group, StringView());
+        info.hasMemoryOnConsole = true;
+        inspector->contextCreated(info);
     }
     Local<Context> ensureDefaultContextInGroup(int group) override {
         for (auto& entry : groups)
@@ -106,6 +164,22 @@ static std::shared_ptr<InspectorHub> hub_for(Isolate* isolate) {
     }
     return hub;
 }
+PyObject* context_enable_console(context_c* context, PyObject*) {
+    if (!context_is_active(context)) {
+        PyErr_SetString(PyExc_RuntimeError, "Context is closed");
+        return nullptr;
+    }
+    IN_ISOLATE(context->isolate_state);
+    auto hub = hub_for(isolate);
+    if (!hub->groups.count(context)) {
+        int group = hub->next_group++;
+        hub->groups[context] = group;
+        hub->context_created(context, group);
+    }
+    if (!context->resources) context->resources = new ContextResources();
+    context->resources->console_inspector = hub;
+    PYV8_RETURN_NONE;
+}
 static PyObject* debugger_new(PyTypeObject* type, PyObject*, PyObject*) {
     return PyType_GenericAlloc(type, 0);
 }
@@ -129,7 +203,7 @@ static int debugger_init(debugger_c* self, PyObject* args, PyObject* kwargs) {
     if (found == hub.groups.end()) {
         state->group = hub.next_group++;
         hub.groups[context] = state->group;
-        hub.inspector->contextCreated(V8ContextInfo(context->js_context.Get(isolate), state->group, StringView()));
+        hub.context_created(context, state->group);
     } else state->group = found->second;
     state->channel = std::make_unique<InspectorChannel>(self);
     state->session = hub.inspector->connect(state->group, state->channel.get(), StringView(), V8Inspector::kFullyTrusted);
@@ -159,8 +233,14 @@ static PyObject* debugger_rebind_context(debugger_c* self, PyObject* object) {
     PyOwnedRef previous_owner(PyV8_NewRef((PyObject*)previous));
     IN_ISOLATE(next->isolate_state);
     auto hub = self->state->hub;
-    if (!hub->pause_stack.empty() || hub->groups.count(next)) {
+    bool next_has_session = std::any_of(hub->sessions.begin(), hub->sessions.end(),
+                                      [next](debugger_c* item) { return item->context == next; });
+    if (!hub->pause_stack.empty() || next_has_session) {
         PyErr_SetString(PyExc_RuntimeError, "cannot replace a paused or already registered context"); return nullptr;
+    }
+    if (hub->groups.count(next)) {
+        hub->inspector->contextDestroyed(next->js_context.Get(isolate));
+        hub->groups.erase(next);
     }
     const int group = self->state->group;
     hub->inspector->contextDestroyed(previous->js_context.Get(isolate));
@@ -172,7 +252,7 @@ static PyObject* debugger_rebind_context(debugger_c* self, PyObject* object) {
         session->context = next;
         Py_DECREF((PyObject*)previous);
     }
-    hub->inspector->contextCreated(V8ContextInfo(next->js_context.Get(isolate), group, StringView()));
+    hub->context_created(next, group);
     PYV8_RETURN_NONE;
 }
 static PyObject* debugger_send(debugger_c* self, PyObject* message) {
@@ -234,12 +314,13 @@ static PyObject* debugger_disconnect(debugger_c* self, PyObject*) {
     auto& sessions = hub->sessions;
     sessions.erase(std::remove(sessions.begin(), sessions.end(), self), sessions.end());
     bool remaining = std::any_of(sessions.begin(), sessions.end(), [self](debugger_c* other) { return other->context == self->context; });
-    if (!remaining) {
+    if (!remaining && (!self->context->resources ||
+                       !self->context->resources->console_inspector)) {
         hub->inspector->contextDestroyed(self->context->js_context.Get(isolate));
         hub->groups.erase(self->context);
     }
     self->state->hub.reset();
-    if (sessions.empty()) inspector_hubs.erase(isolate);
+    if (sessions.empty() && hub->groups.empty()) inspector_hubs.erase(isolate);
     PYV8_RETURN_NONE;
 }
 bool debugger_context_can_close(context_c* context) {
@@ -290,6 +371,12 @@ void debugger_context_closed(context_c* context) {
         PyObject* result = debugger_disconnect(session, nullptr);
         Py_XDECREF((PyObject*)result);
     }
+    if (hub->groups.count(context)) {
+        hub->inspector->contextDestroyed(context->js_context.Get(isolate));
+        hub->groups.erase(context);
+    }
+    if (context->resources) context->resources->console_inspector.reset();
+    if (hub->groups.empty() && hub->sessions.empty()) inspector_hubs.erase(isolate);
 }
 void debugger_prepare_script(context_c* context) {
     auto found = inspector_hubs.find(context->isolate_state->isolate());

@@ -134,6 +134,9 @@ class _WindowFeatureValues(LazyValueStore):
     def _create_value(self, slot):
         return self._runtime.create_window_value(slot, self._window)
 
+    def _discard_local_storage(self):
+        self._values.pop("localStorage", None)
+
 
 #: The window's own bar properties, one name each.
 BAR_NAMES = ("locationbar", "menubar", "toolbar", "statusbar", "scrollbars", "personalbar")
@@ -162,7 +165,8 @@ def _singleton_values(window):
         "scheduler": lambda: Scheduler(services=window._services),
         "cookieStore": lambda: CookieStore(services=window._services),
         "navigation": lambda: Navigation(window=window),
-        "trustedTypes": TrustedTypePolicyFactory,
+        "trustedTypes": lambda: TrustedTypePolicyFactory(
+            policy=getattr(window, '_content_policy', None)),
         **{name: bar(name) for name in BAR_NAMES},
     })
 
@@ -288,6 +292,7 @@ class Window(_SchedulingMixin, WindowProperties):
     def __init__(self, services=None, feature_runtime=None, **kw):
         super().__init__(services=services, **kw); self._services = services
         self._origin = getattr(services, "_origin", ("opaque", object()))
+        self._storage_origin = self._origin
         self._location_cache = None
         #: Set for a window a frame owns; the element is what survives navigation.
         self._frame_element = None
@@ -338,6 +343,10 @@ class Window(_SchedulingMixin, WindowProperties):
     @property
     def localStorage(self):
         return self._features.value("localStorage")
+
+    def _rebind_initial_storage(self, origin):
+        self._storage_origin = origin
+        self._features._discard_local_storage()
 
     @property
     def sessionStorage(self):
@@ -600,9 +609,8 @@ class Window(_SchedulingMixin, WindowProperties):
         return window_secure_context(self)
 
     def get_crossOriginIsolated(self):
-        """Whether the document is cross-origin isolated: no COOP/COEP is set."""
         self._require_same_origin()
-        return False
+        return bool(self._services.realm_services.cross_origin_isolated)
 
     def get_originAgentCluster(self): self._require_same_origin(); return False
     def get_credentialless(self): self._require_same_origin(); return False

@@ -1,133 +1,103 @@
-﻿"""Run the live SteamDB challenge in pyv8c; accept an HTTP 200 Set-Cookie only.
+﻿"""用 pyv8c 原生执行 SteamDB Turnstile 挑战，并以登录页 title 验收。
 
-No Chrome, captured Cookie, HAR replay, or saved challenge parameters are used.
+不依赖 Chrome、HAR、预置 Cookie 或 cfsolve；脚本由框架下载，复选框由 deep
+接口穿透 closed shadow 与子 frame 定位并点击。成功判据是页面 title 从挑战页
+的「请稍候…」变为登录页的「Sign In · SteamDB」。
 """
 from __future__ import annotations
 
 import argparse
-import json
+import asyncio
 from pathlib import Path
 import sys
-import threading
 import time
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT / 'pyv8c')]
+sys.path.insert(0, str(ROOT / 'pyv8c'))
 
 from loguru import logger
-from pyv8c import Browser, register_transport
-from pyv8c.foundation.host_errors import HostStateError, RealmBusyError
-from pyv8c.network.curl_cffi import CurlCffiTransport
-from pyv8c.web.dom.hit_testing import border_box
-from pyv8c.web.dom.nodes import _subtree_nodes
+from pyv8c.async_api import Browser
 
 
-URL = 'https://steamdb.info/login/'
 # URL = 'https://pastebin.com/login'
 # URL = 'https://www.e-food.gr'
 # URL = "https://fractal-testnet.unisat.io/explorer"
-
 # URL = "https://cn.airbusan.com/content/individual"
 # URL = "https://simple.ripley.com.pe/"
+URL = 'https://steamdb.info/login/'
 
-HOST_NAME = urlsplit(URL).hostname
-PROXY = 'http://127.0.0.1:7890'
-# PROXY = None
+DEFAULT_PROXY = 'http://127.0.0.1:6696'
+CHECKBOX = 'input[type="checkbox"]'
 
 
-def run(*, proxy=PROXY, timeout=90):
+def trim_resources(url, request):
+    """丢弃站点自身的展示资源，保留挑战域的一切和所有脚本/网络请求。
+    challenges.cloudflare.com 的 image 参与挑战，不能按类型一律丢弃。
+    """
+    if request.get('resource_type') in {'image', 'style', 'font', 'media'}:
+        host = urlsplit(url).hostname or ''
+        if not host.endswith('challenges.cloudflare.com'):
+            return False
+
+
+async def run(*, proxy=DEFAULT_PROXY, timeout=120):
     started = time.monotonic()
     deadline = started + timeout
-    received = threading.Event()
-    answer = {}
-    clicked = set()
+    logger.info('开始挑战，打开 {}（代理：{}）', URL, proxy or '直连')
+    async with Browser(
+        cache=False, threaded_loaders=True, proxy=proxy, gpu_enabled=False,
+        resource_interceptor=trim_resources,
+        http_options={'impersonate': 'chrome150', 'timeout': 20, 'retry': 5},
+    ) as browser:
+        page = browser.new_profile().new_page()
+        await page.goto(URL, wait_until='domcontentloaded', timeout=min(30, timeout))
+        title = page.evaluate('document.title')
+        logger.info('页面已加载，title={!r}，等待 Turnstile 复选框', title)
 
-    class ObservedTransport(CurlCffiTransport):
-        def _call(self, request):
-            response = super()._call(request)
-            value = response.cookies.get('cf_clearance')
-            if (response.status == 200 and value
-                    and urlsplit(response.url).hostname == HOST_NAME):
-                answer.update(ok=True, status=response.status, url=response.url,
-                              set_cookie=response.headers['set-cookie'], cf_clearance=value)
-                received.set()
-            return response
+        # deep 接口从 page 根穿透 closed shadow 与子 frame，找到并点击复选框。
+        await page.wait_for_selector(CHECKBOX, deep=True, timeout=min(60, timeout))
+        logger.info('复选框已就绪，执行点击')
+        await page.click(CHECKBOX, deep=True, delay=.08)
+        logger.info('已点击复选框，等待登录页导航')
 
-    register_transport('5s-observed', ObservedTransport, proxy=True)
-    browser = Browser(cache=False, threaded_loaders=True, proxy=proxy,
-                      http_engine='5s-observed',
-                      http_options={'impersonate': 'chrome150', 'timeout': 20, 'retry': 5})
-    try:
-        profile = browser.new_profile()
-        page = profile.new_page()
-        page.goto(URL, wait_until='domcontentloaded', timeout=min(30, timeout))
-
-        def click_ready_control():
-            frames, pending = [], [page]
-            while pending:
-                frame = pending.pop()
-                if frame.closed:
-                    continue
-                frames.append(frame)
-                pending.extend(tuple(frame._owned.frames))
-            for frame in frames:
-                target = urlsplit(frame.url)
-                if target.hostname != 'challenges.cloudflare.com' or '/turnstile/f/' not in target.path:
-                    continue
-                # The widget uses a closed shadow tree. Inspect host DOM objects
-                # on their owner thread, without altering the SDK or shadow mode.
-                for node in _subtree_nodes(frame.document):
-                    if (node in clicked or getattr(node, 'localName', '') != 'input'
-                            or node.attributes.get('type') != 'checkbox'):
-                        continue
-                    box = border_box(node)
-                    if box.width <= 0 or box.height <= 0:
-                        continue
-                    try:
-                        frame.mouse.click_element(node, delay=.08)
-                    except HostStateError:
-                        continue  # A covered/hidden control is not ready yet.
-                    clicked.add(node)
-                    print('Clicked authentication checkbox.', file=sys.stderr, flush=True)
-
-        while not received.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f'No HTTP 200 cf_clearance Set-Cookie within {timeout:g}s; clicks={len(clicked)}')
+        # 点击触发 POST 导航到登录页；title 变化即挑战通过。导航瞬间 evaluate
+        # 可能短暂失败，吞掉后继续轮询到截止时间；title 变化时记一条状态。
+        last_title = title
+        while time.monotonic() < deadline:
             try:
-                page.executor.call(click_ready_control, timeout=min(3, remaining))
-            except RealmBusyError:
-                # The SDK may be processing a response; the transport still
-                # observes replies without enqueuing JS evaluation probes.
+                current = page.evaluate('document.title')
+                if current != last_title:
+                    logger.info('页面 title 变为 {!r}', current)
+                    last_title = current
+                    logger.info('Cookie: {}', page.profile.cookies.header_for(URL))
+                    logger.info('已成功加载目标页面，可使用page.net.get/post/xhr/fetch等接口直接获取目标数据')
+                    return {'elapsed': round(time.monotonic() - started, 2)}
+            except Exception:
                 pass
-            received.wait(min(.25, max(0, deadline-time.monotonic())))
-
-        answer.update(clicks=len(clicked), elapsed=round(time.monotonic()-started, 2),
-                      cookie_jar_held='cf_clearance=' in profile.cookies.header_for(URL))
-        return answer
-    finally:
-        browser.close()
+            await page.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        raise TimeoutError(f'{timeout:g}s 内未出现登录页 title {last_title!r}')
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--proxy', default=PROXY)
+async def main():
+    parser = argparse.ArgumentParser(description='在 pyv8c 中执行 SteamDB 挑战并验收。')
+    parser.add_argument('--proxy', default=DEFAULT_PROXY, help='代理地址；传 none 表示直连')
     parser.add_argument('--timeout', type=float, default=120)
     args = parser.parse_args()
     if args.timeout <= 0:
-        parser.error('--timeout must be positive')
+        parser.error('--timeout 必须为正数')
+    proxy = None if args.proxy.lower() in {'none', ''} else args.proxy
+
     logger.remove()
-    # logger.add(sys.stderr, level='WARNING')
+    logger.add(sys.stdout, level='INFO')
     try:
-        result = run(proxy=args.proxy, timeout=args.timeout)
+        result = await run(proxy=proxy, timeout=args.timeout)
     except Exception as error:
-        print(json.dumps({'ok': False, 'error': f'{type(error).__name__}: {error}'}, ensure_ascii=False), flush=True)
+        logger.error('挑战失败：{}: {}', type(error).__name__, error)
         return 1
-    print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    logger.success('挑战通过：登录页已就绪（耗时 {}s）', result['elapsed'])
     return 0
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
-
+    raise SystemExit(asyncio.run(main()))

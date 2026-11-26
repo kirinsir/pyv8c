@@ -32,6 +32,13 @@ struct ContextLifetime {
 struct ContextResources {
     std::size_t handle_count() const { return handles.size(); }
     std::vector<std::shared_ptr<WasmStreamSession>> wasm_streams;
+    // Type-erased shared_ptr<InspectorHub>, owned by tools/debugger.cpp.  Its
+    // contract here is lifetime only: while non-null it keeps the V8Inspector
+    // (and this realm's registration with it for console.memory) alive.  Do not
+    // dereference it in this layer; debugger.cpp only tests it and resets it on
+    // context close.  A non-null value also means the last Debugger.disconnect()
+    // must not destroy the inspector registration by itself.
+    std::shared_ptr<void> console_inspector;
 private:
     friend class IsolateState;
     friend PyObject* context_new(PyTypeObject*, PyObject*, PyObject*);
@@ -78,6 +85,7 @@ struct TraceSourceFilter {
     X(trace_event_names)     \
     X(uncaught_handler)      \
     X(rejection_handler)     \
+    X(code_generation_handler) \
     X(dependencies)
 
 typedef struct context_c
@@ -94,6 +102,7 @@ typedef struct context_c
     PyObject* callback_targets;
     PyObject* uncaught_handler;
     PyObject* rejection_handler;
+    PyObject* code_generation_handler;
     PyObject* dependencies;
     ContextResources* resources;
     ContextState state;
@@ -158,6 +167,9 @@ bool context_is_detached(v8::Local<v8::Context> context);
 //: Mark a realm as left behind (``context_is_detached``).
 PyObject* context_detach(context_c* self, PyObject* ignored);
 bool context_check_callback(v8::Local<v8::Context> context);
+PyObject* context_set_code_generation_handler(context_c*, PyObject*);
+v8::ModifyCodeGenerationFromStringsResult context_modify_code_generation(
+    v8::Local<v8::Context>, v8::Local<v8::Value>, bool);
 void context_finish_close(context_c* self);
 void context_register_handle(context_c* self, PyObject* handle, int (*clear)(PyObject*));
 void context_unregister_handle(context_c* self, PyObject* handle);

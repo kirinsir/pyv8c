@@ -52,7 +52,7 @@ class _AttributeMap(dict):
 
     def _changed(self, key):
         self._owner._invalidate_layout()
-        if (getattr(self._owner, "localName", "") in ("style", "link")
+        if (self._owner.localName in ("style", "link")
                 and key in ("rel", "href", "media", "disabled")):
             document = self._owner.ownerDocument
             if document is not None:
@@ -118,6 +118,8 @@ class _AttributeMap(dict):
 @interface('Element', 'Node')
 class Element(_ParentNodeMixin, _ChildNodeMixin, _NonDocumentTypeChildNodeMixin, Node):
     """Base implementation for HTML and XML elements."""
+
+    _attribute_changed = None
 
     def fn_checkVisibility(self, options=pyv8.Undefined, *_extra):
         """Whether this element is rendered, as Chrome's ``checkVisibility`` answers it.
@@ -271,12 +273,14 @@ class Element(_ParentNodeMixin, _ChildNodeMixin, _NonDocumentTypeChildNodeMixin,
         self.attributes['class'] = str(value)
     def get_innerHTML(self): return "".join(c.outer_html() for c in self._children)
     def set_innerHTML(self, value):
-        value = dom_string(value)
+        from ..bom.trusted_types import trusted_string
+        value = trusted_string(self._services, value, 'HTML', 'Element innerHTML')
         self._replace_children(())
         if self._services: self._services.document_services.document._parse_fragment(str(value), self)
     def get_outerHTML(self): return self.outer_html()
     def set_outerHTML(self, value):
-        value = dom_string(value)
+        from ..bom.trusted_types import trusted_string
+        value = trusted_string(self._services, value, 'HTML', 'Element outerHTML')
         if self.parentNode: self.parentNode.fn_replaceChild(self._services.document_services.document._parse_one(str(value)), self)
     def get_children(self):
         collection = self.__dict__.get('_children_collection')
@@ -431,7 +435,15 @@ class Element(_ParentNodeMixin, _ChildNodeMixin, _NonDocumentTypeChildNodeMixin,
             raise missing_error('Element', 'setAttribute', 2, 0, constructor=False)
         if value is MISSING:
             raise missing_error('Element', 'setAttribute', 2, 1, constructor=False)
-        self._set_attribute(dom_string(name), dom_string(value))
+        name = dom_string(name)
+        key = name.lower()
+        kind = ('ScriptURL' if self.localName == 'script' and key == 'src' else
+                'HTML' if self.localName == 'iframe' and key == 'srcdoc' else
+                'Script' if key.startswith('on') else None)
+        if kind:
+            from ..bom.trusted_types import trusted_string
+            value = trusted_string(self._services, value, kind, f'Element setAttribute({key})')
+        self._set_attribute(name, dom_string(value))
     def fn_removeAttribute(self, name=MISSING, *_extra):
         if name is MISSING:
             raise missing_error('Element', 'removeAttribute', 1, 0, constructor=False)
@@ -636,6 +648,13 @@ class Element(_ParentNodeMixin, _ChildNodeMixin, _NonDocumentTypeChildNodeMixin,
             raise missing_error('Element', 'querySelector', 1, 0, constructor=False)
         selector = dom_string(selector)
         return self._services.document_services.document.query_selector(selector, self) if self._services else pyv8.Null
+
+    def fn_computedStyleMap(self, *_extra):
+        from ..css.typed import StylePropertyMapReadOnly
+        result = getattr(self, '_computed_style_map', None)
+        if result is None:
+            result = self._computed_style_map = StylePropertyMapReadOnly(element=self, computed=True)
+        return result
     def fn_querySelectorAll(self, selector=MISSING, *_extra):
         if selector is MISSING:
             raise missing_error('Element', 'querySelectorAll', 1, 0, constructor=False)

@@ -19,7 +19,7 @@ from ...foundation.environment import environment_of
 from ...foundation.font_sizes import font_size_term as _font_size_term
 from ...foundation.system_fonts import file_for, normalize, table_of
 from .character_data import Text
-from ..css.cascade import _cascade, _number, _px, _root_font_size, computed_style, document_rules, rules_for
+from ..css.cascade import StyleRules, _cascade, _number, _px, _root_font_size, computed_style, document_rules, rules_for
 from .element import Element
 
 
@@ -293,14 +293,23 @@ class _LineStyle:
 
 
 def _font_metrics(style, environment=None):
-    """The face's own extents for a style, or ``None`` when no face can be read."""
-    record = _face_for(_families(style), environment, style.get("font-weight", "400"),
-                       style.get("font-style", "normal"))
-    path = _face_path(record)
-    if path is None:
-        return None
-    found = text_engine.metrics(path, index=getattr(record, "index", 0), size=_font_size(style))
-    return found if found.height else None
+    """The face's own extents for a style, or ``None`` when no face can be read.
+
+    A catalog record whose file is not on this machine is not a face. The Windows
+    profile names Segoe UI and Noto Sans SC; measurement uses the first face in
+    the same chain that actually opens.
+    """
+    chain = _face_chain(_families(style), environment, style.get("font-weight", "400"),
+                        style.get("font-style", "normal"))
+    size = _font_size(style)
+    for record in chain:
+        path = _face_path(record)
+        if path is None:
+            continue
+        found = text_engine.metrics(path, index=getattr(record, "index", 0), size=size)
+        if found.height:
+            return found
+    return None
 
 
 def _line_style(style, environment=None, root=16.0, found=None):
@@ -451,7 +460,7 @@ class _Walk:
     """One layout pass: the rules to cascade, where boxes go, the viewport, and what is filled
     in as it runs -- ``baselines`` per element, ``overflows`` for ``scrollWidth``.
     """
-    rules: tuple
+    rules: StyleRules
     collected: dict | None
     viewport: tuple
     baselines: dict = field(default_factory=dict)

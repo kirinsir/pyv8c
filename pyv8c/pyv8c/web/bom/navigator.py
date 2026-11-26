@@ -667,6 +667,10 @@ class Permissions:
         return name
 
     def _state(self, name):
+        feature = {'audio_capture': 'microphone', 'video_capture': 'camera'}.get(name, name)
+        realm = getattr(self._services, 'realm_services', None)
+        if realm is not None and not realm.permission_allowed(feature):
+            return 'denied'
         if name == "geolocation":
             return self._environment.geolocation.permission
         if name in ("background-fetch", "storage-access"):
@@ -956,8 +960,15 @@ class StorageManager:
         return _settled(self._services, value=False)
 
     def fn_getDirectory(self, *_extra):
-        return _settled(self._services, error=dom_exception(
-            "NotSupportedError", "The origin private file system is not implemented here."))
+        invalid = promise_receiver_error(self, StorageManager, 'getDirectory')
+        if invalid is not None:
+            return invalid
+        from .opfs import bucket_directory
+        try:
+            directory = bucket_directory(self._services)
+        except (PageTypeError, DOMException) as error:
+            return promise_rejected_in_caller_realm(error, self._services)
+        return _settled(self._services, value=directory)
 
 
 def _navigator_values(navigator):
@@ -1280,6 +1291,8 @@ class GPU:
         realm = getattr(self._services, "realm_services", None)
         if realm is None:
             return pyv8.Null
+        if not getattr(self._services, 'gpu_enabled', True):
+            return realm.promise_resolve(pyv8.Null)
         environment = environment_of(self._services)
         gpu = getattr(environment, "gpu", None) if environment is not None else None
         adapter_data = getattr(gpu, "adapter", None) or {}

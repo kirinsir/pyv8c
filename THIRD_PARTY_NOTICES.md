@@ -46,18 +46,19 @@ V8 源码树各子目录下的 `LICENSE` 文件包含更细的第三方信息，
 
 ## 2. Chromium / Blink Web IDL 基线
 
-- **组件**：`pyv8c/pyv8c/idl/idl.zip` 及 `idls/`、`docs/` 中由 Chromium Web IDL 定义生成的接口规格；`CHROMIUM_VERSION` 记录基线版本。
-- **基线版本**：Chromium 154.0.8030.0。
+- **组件**：默认包内 `pyv8c/pyv8c/idl/idl.zip`，以及 `idls/`、`docs/` 中由 Chromium Web IDL 定义生成的接口规格。`CHROMIUM_VERSION` 记录默认基线。
+- **基线版本**：默认 `idl.zip` 为 Chromium 154.0.8030.0。
+- **可选档案**：`pyv8c/pyv8c/idl/idl-158.0.8127.36.zip` 与 `pyv8c/idls/158.0.8127.36.zip` 是 Chromium 158.0.8127.36 的同类 IDL 提取，随包分发。只有调用方传入打包的 Mac 环境档案、且未另给 `idl_path` 时才使用。许可与版权和默认基线相同。
 - **许可**：BSD 3-Clause "New" or "Revised" License（`BSD-3-Clause`）。
 - **版权**：Copyright 2015 The Chromium Authors；其他文件可能携带各自的版权声明。
 - **上游原文**：<https://chromium.googlesource.com/chromium/src/+/main/LICENSE>
-- **固定版本原文**：[CHROMIUM-LICENSE.txt](third_party_licenses/CHROMIUM-LICENSE.txt)，来自 Chromium 154.0.8030.0。
+- **固定版本原文**：[CHROMIUM-LICENSE.txt](third_party_licenses/CHROMIUM-LICENSE.txt)，来自 Chromium 154.0.8030.0。158 档案沿用同一份许可文本。
 
 这里的 IDL 数据是从 Chromium/Blink 接口定义提取、整理出的规格信息；保留上游版权和许可声明供下游核对。
 
 ### Blink 音频压缩器
 
-动态压缩器实现位于 Rust 扩展 `pyv8c/audio_native/src/compressor.rs`，改写自 Chromium Blink 的 `third_party/blink/renderer/platform/audio/dynamics_compressor.cc`，版权为 Copyright (C) 2011 Google Inc.；其 BSD 许可条款含 Apple 的特定名称和免责声明，与 Chromium 顶层文本不同。完整原文见 [BLINK-AUDIO-LICENSE.txt](third_party_licenses/BLINK-AUDIO-LICENSE.txt)，该源码文件顶部也保留了许可头。旧的 Python 实现 `pyv8c/pyv8c/web/bom/audio_compressor.py` 已移除。
+动态压缩器实现位于 Rust 扩展 `pyv8c/native/src/audio/compressor.rs`，改写自 Chromium Blink 的 `third_party/blink/renderer/platform/audio/dynamics_compressor.cc`，版权为 Copyright (C) 2011 Google Inc.；其 BSD 许可条款含 Apple 的特定名称和免责声明，与 Chromium 顶层文本不同。完整原文见 [BLINK-AUDIO-LICENSE.txt](third_party_licenses/BLINK-AUDIO-LICENSE.txt)，该源码文件顶部也保留了许可头。旧的 Python 实现 `pyv8c/pyv8c/web/bom/audio_compressor.py` 已移除。
 
 ---
 
@@ -69,11 +70,14 @@ V8 源码树各子目录下的 `LICENSE` 文件包含更细的第三方信息，
 
 该数据文件由 V8 构建链带入；外部数据或不同构建可能使用其他版本，应携带该构建实际使用的许可文件。
 
+构建 V8 时还要打上 `pyv8/patches/icu-thread-datetime.patch`。补丁只给 `TimeZone::createDefault` 和 `Locale::getDefault` 增加线程局部覆盖，不替换 `icudtl.dat`，也不改 ICU 版本。许可仍是上面的 ICU 许可。
+
 ---
 
 ## 4. Chrome 运行时环境档案
 
-- **组件**：`pyv8c/pyv8c/data/chrome-environment.json`（schema 4），记录从本机 Chrome 156.0.8078.80 采集的接口与属性观测值，用于决定 Window 自有属性顺序等环境行为。
+- **组件**：`pyv8c/pyv8c/data/chrome-environment.json`（schema 4），记录从本机 Chrome 156.0.8078.80 采集的接口与属性观测值，用于决定 Window 自有属性顺序等环境行为。无参 Browser 整份使用这份档案。
+- **Darwin 档案**：`pyv8c/pyv8c/data/chrome-environment-darwin.json` 是从本机 Chrome 158.0.8127.36 采集的同类观测。无参 Browser 不读取它；调用方把该路径传给 `environment` 时整份使用。
 - **性质**：对公开运行时行为的事实性观测数据，不包含 Chrome 的实现代码。
 - **注意**：`Chrome`、`Chromium`、`V8`、`Google` 均为各自权利人的商标或标识；本项目与 Google 及 Chromium 项目无关联、未获背书。上述 BSD-3-Clause 第 3 条禁止借其名义为衍生产品背书。
 
@@ -103,6 +107,10 @@ V8 源码树各子目录下的 `LICENSE` 文件包含更细的第三方信息，
 | Pillow | MIT-CMU | 13.0.0 | Canvas 像素后端 |
 | comfy-angle | BSD-3-Clause（ANGLE）/ MIT（Electron 组件） | 0.1.1 | 实验性 WebGL 后端；wheel 内含 `electron-LICENSE` 与 `LICENSES.chromium.html`，以其为准 |
 | playwright | Apache-2.0 | 1.64.1 | 仅 `reference` extra，用于本机 Chrome 对照 |
+| geoip2 | Apache-2.0 | 5.4.0 | 可选 `geoip` extra。版本取自本机 `.venv` 的 `License-Expression`，不是 `.venv315` |
+| maxminddb | Apache-2.0 | 3.3.0 | `geoip2` 的传递依赖。版本同样取自本机 `.venv` |
+
+`GeoLite2-City.mmdb` 不进仓库，也不打进 wheel。未提供 `geoip_db` 或 `PYV8C_GEOIP_DB` 时，`Browser(geoip=True)` 在第一次 `new_profile()` 把它下载到用户缓存。该数据由 MaxMind 创建。使用时保留署名：This product includes GeoLite2 data created by MaxMind, available from <https://www.maxmind.com>.
 
 ### 仅开发 / 测试
 
@@ -119,7 +127,7 @@ pip-licenses --format=markdown --with-urls --with-license-file
 
 ## 6. 发行前待完成的第三方审计
 
-音频波形扩展使用 PyO3 0.27.2、RustFFT 6.4.1 及其 Cargo.lock 所列依赖。扩展中采用 Chromium 的 FFT 数据布局；对应的上游许可证在 `third_party_licenses/CHROMIUM-LICENSE.txt`，Rust crate 许可证文本在 `third_party_licenses/AUDIO-RUST-CRATES-LICENSES.txt`。依赖升级后应重新核对并更新许可证材料。
+统一原生扩展的音频组件使用 PyO3 0.27.2、RustFFT 6.4.1 及其运行时依赖。扩展采用 Chromium 的 FFT 数据布局，对应的上游许可证在 `third_party_licenses/CHROMIUM-LICENSE.txt`。所链接的 Rust crate 许可证文本在 `third_party_licenses/AUDIO-RUST-CRATES-LICENSES.txt`。构建脚本使用 `cc` 编译 DOM C++ 源码，并使用 `sha2` 记录源码摘要。这两个 crate 仅在构建期间使用。依赖升级后应重新核对并更新许可证材料。
 
 V8 的 monolith 和各平台链接输入还可能包含其自身的第三方代码。特别是 Windows 构建会链接 Temporal 的 Rust 库及其传递依赖；不同平台、GN 参数、V8 来源和 ICU 覆盖均可能改变组成。上述文件不是完整物料清单，不能仅凭通过基础检查就认定 wheel 可发布。
 
